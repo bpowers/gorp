@@ -394,6 +394,85 @@ func (t *TableMap) bindInsert(elem reflect.Value) (bindInstance, error) {
 	return plan.createBindInstance(elem, t.dbmap.TypeConverter)
 }
 
+func (t *TableMap) bindUpsert(elem reflect.Value) (bindInstance, error) {
+	plan := t.insertPlan
+	if plan.query == "" {
+		plan.autoIncrIdx = -1
+
+		s := bytes.Buffer{}
+		s2 := bytes.Buffer{}
+		s.WriteString(fmt.Sprintf("insert into %s (", t.dbmap.Dialect.QuotedTableForQuery(t.SchemaName, t.TableName)))
+
+		x := 0
+		first := true
+		for y := range t.Columns {
+			col := t.Columns[y]
+			if !(col.isAutoIncr && t.dbmap.Dialect.AutoIncrBindValue() == "") {
+				if !col.Transient {
+					if !first {
+						s.WriteString(",")
+						s2.WriteString(",")
+					}
+					s.WriteString(t.dbmap.Dialect.QuoteField(col.ColumnName))
+
+					if col.isAutoIncr {
+						s2.WriteString(t.dbmap.Dialect.AutoIncrBindValue())
+						plan.autoIncrIdx = y
+						plan.autoIncrFieldName = col.fieldName
+					} else {
+						s2.WriteString(t.dbmap.Dialect.BindVar(x))
+						if col == t.version {
+							plan.versField = col.fieldName
+							plan.argFields = append(plan.argFields, versFieldConst)
+						} else {
+							plan.argFields = append(plan.argFields, col.fieldName)
+						}
+
+						x++
+					}
+					first = false
+				}
+			} else {
+				plan.autoIncrIdx = y
+				plan.autoIncrFieldName = col.fieldName
+			}
+		}
+		s.WriteString(") values (")
+		s.WriteString(s2.String())
+		s.WriteString(") on duplicate key update ")
+		first = true
+		for y := range t.Columns {
+			col := t.Columns[y]
+			if !(col.isAutoIncr && t.dbmap.Dialect.AutoIncrBindValue() == "") {
+				if !col.Transient && !col.isPK {
+					if !first {
+						s.WriteString(",")
+					}
+					quotedColName := t.dbmap.Dialect.QuoteField(col.ColumnName)
+					s.WriteString(quotedColName)
+					s.WriteString("=VALUES(")
+					s.WriteString(quotedColName)
+					s.WriteString(")")
+
+					first = false
+				}
+			} else {
+				plan.autoIncrIdx = y
+				plan.autoIncrFieldName = col.fieldName
+			}
+		}
+		if plan.autoIncrIdx > -1 {
+			s.WriteString(t.dbmap.Dialect.AutoIncrInsertSuffix(t.Columns[plan.autoIncrIdx]))
+		}
+		s.WriteString(t.dbmap.Dialect.QuerySuffix())
+
+		plan.query = s.String()
+		t.insertPlan = plan
+	}
+
+	return plan.createBindInstance(elem, t.dbmap.TypeConverter)
+}
+
 func (t *TableMap) bindUpdate(elem reflect.Value) (bindInstance, error) {
 	plan := t.updatePlan
 	if plan.query == "" {
@@ -1170,6 +1249,10 @@ func (t *Transaction) Insert(list ...interface{}) error {
 	return insert(t.dbmap, t, list...)
 }
 
+func (t *Transaction) Upsert(list ...interface{}) error {
+	return upsert(t.dbmap, t, list...)
+}
+
 // Update had the same behavior as DbMap.Update(), but runs in a transaction.
 func (t *Transaction) Update(list ...interface{}) (int64, error) {
 	return update(t.dbmap, t, list...)
@@ -1911,6 +1994,67 @@ func insert(m *DbMap, exec SqlExecutor, list ...interface{}) error {
 		}
 
 		bi, err := table.bindInsert(elem)
+		if err != nil {
+			return err
+		}
+
+		if bi.autoIncrIdx > -1 {
+			f := elem.FieldByName(bi.autoIncrFieldName)
+			switch inserter := m.Dialect.(type) {
+			case IntegerAutoIncrInserter:
+				id, err := inserter.InsertAutoIncr(exec, bi.query, bi.args...)
+				if err != nil {
+					return err
+				}
+				k := f.Kind()
+				if (k == reflect.Int) || (k == reflect.Int16) || (k == reflect.Int32) || (k == reflect.Int64) {
+					f.SetInt(id)
+				} else if (k == reflect.Uint16) || (k == reflect.Uint32) || (k == reflect.Uint64) {
+					f.SetUint(uint64(id))
+				} else {
+					return fmt.Errorf("gorp: Cannot set autoincrement value on non-Int field. SQL=%s  autoIncrIdx=%d autoIncrFieldName=%s", bi.query, bi.autoIncrIdx, bi.autoIncrFieldName)
+				}
+			case TargetedAutoIncrInserter:
+				err := inserter.InsertAutoIncrToTarget(exec, bi.query, f.Addr().Interface(), bi.args...)
+				if err != nil {
+					return err
+				}
+			default:
+				return fmt.Errorf("gorp: Cannot use autoincrement fields on dialects that do not implement an autoincrementing interface")
+			}
+		} else {
+			_, err := exec.Exec(bi.query, bi.args...)
+			if err != nil {
+				return err
+			}
+		}
+
+		if v, ok := eval.(HasPostInsert); ok {
+			err := v.PostInsert(exec)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func upsert(m *DbMap, exec SqlExecutor, list ...interface{}) error {
+	for _, ptr := range list {
+		table, elem, err := m.tableForPointer(ptr, false)
+		if err != nil {
+			return err
+		}
+
+		eval := elem.Addr().Interface()
+		if v, ok := eval.(HasPreInsert); ok {
+			err := v.PreInsert(exec)
+			if err != nil {
+				return err
+			}
+		}
+
+		bi, err := table.bindUpsert(elem)
 		if err != nil {
 			return err
 		}
